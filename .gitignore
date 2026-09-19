@@ -1,6 +1,3 @@
-# 비밀 키
-tts_api_key.txt
-
 # 개인 설정·사용량 (실행하면 자동 생성)
 config.json
 usage.json
