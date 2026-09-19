@@ -1,0 +1,13 @@
+# 비밀 키
+tts_api_key.txt
+
+# 개인 설정·사용량 (실행하면 자동 생성)
+config.json
+usage.json
+
+# 만들어 둔 음성 캐시 (언제든 다시 만들 수 있음)
+audio_cache/
+
+# Python
+__pycache__/
+*.pyc
