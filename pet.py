@@ -43,6 +43,15 @@ GLOW_BANDS = [(0, 4, "#fff8d6"), (4, 6, "#ffd54f"), (10, 8, "#ffb300"), (18, 10,
 SPARK_COLORS = ("#ffd54f", "#fff59d", "#ffffff", "#ffb74d", "#b3e5fc", "#f8bbd0")
 GWL_EXSTYLE, WS_EX_LAYERED, WS_EX_TRANSPARENT, WS_EX_NOACTIVATE = -20, 0x80000, 0x20, 0x08000000
 
+# 잊으면 안 되는 일: 정해진 요일·시각에 다른 설정을 모두 제치고 화려하게 알린다.
+SPECIAL_WEEKDAY = 0                 # 0=월요일 ... 6=일요일
+SPECIAL_AT = "10:55"
+SPECIAL_TEXT = "무료음료창고 개방해 주세요 !!!"
+SPECIAL_HOLD = 15                   # 화면에 붙잡아 두는 시간(초). 펫을 누르면 바로 닫힌다
+SPECIAL_CATCHUP = 5                 # 절전 등으로 놓쳤어도 이 시간(분) 안에는 늦게라도 알린다
+PARTY_COLORS = ("#ff4081", "#ffd54f", "#40c4ff", "#69f0ae", "#b388ff", "#ff6e40")
+PARTY_INK = ("#b71c1c", "#1a237e", "#1b5e20")   # 글자는 읽혀야 하니 진한 색으로만 번갈아
+
 # 여성 음성만. Chirp3 HD(최신 고품질) → Neural2 → WaveNet → Standard 순으로 자연스럽다.
 _HD = [("아오이데", "Aoede"), ("코레", "Kore"), ("레다", "Leda"), ("제피르", "Zephyr"), ("아케르나르", "Achernar"),
        ("아우토노에", "Autonoe"), ("칼리로에", "Callirrhoe"), ("데스피나", "Despina"), ("에리노메", "Erinome"),
@@ -66,13 +75,14 @@ DEFAULTS = {
     "sound": "", "messages": [],
     "api_from": "07:40", "api_to": "12:00",   # 이 시간대에만 새 '시각 멘트'를 API로 생성
     "monthly_char_limit": 50000,              # 한 달 API 글자 수 상한
-    "silent": False,          # 무음 모드: 딩동·음성 없이 화면 효과로만 알린다
+    "silent": True,           # 무음 모드(기본값): 딩동·음성 없이 화면 효과로만 알린다
     "quiet_sec": 8,           # 소리 없이 알릴 때 말풍선을 띄워두는 시간(초)
     "fx_glow": True,          # 화면 테두리 번쩍이기
     "fx_sparkle": True,       # 펫 주변 반짝이
     "fx_hop": True,           # 말하는 동안 폴짝폴짝 뛰기
     "fx_gif": "",             # 펫 뒤에서 재생할 효과 GIF(선택)
     "pos": None,              # 끌어다 놓은 자리 [x, 그 모니터 작업 영역의 아래쪽 y]
+    "special": True,          # 월요일 특별 알림 사용
 }
 
 # 시각 읽기 문구. {t} 는 '오후 7시 10분' / '오후 7시 정각' (항상 받침으로 끝나 '이' 계열이 자연스럽다)
@@ -378,17 +388,22 @@ def star_points(x, y, r):
 
 class Glow:
     """알림 때 화면 테두리를 잠깐 번쩍이는 오버레이 창. 클릭은 그대로 통과한다."""
-    FRAMES = 46          # 35ms x 46 = 약 1.6초
 
     def __init__(self, master):
         self.master = master
         self.wins = []
+        self.bands = []      # (캔버스, 테두리 도형 id들) - 파티 모드에서 색을 돌린다
         self.step = 0
+        self.frames = 46
+        self.party = False
         self.timer = None
 
-    def flash(self, rects=None):
-        """rects 를 주면 그 영역들에, 없으면 모든 모니터에 테두리를 띄운다."""
+    def flash(self, rects=None, party=False, seconds=1.6):
+        """rects 를 주면 그 영역들에, 없으면 모든 모니터에 테두리를 띄운다.
+        party면 색이 돌아가며 그 시간 내내 빠르게 깜빡인다."""
         self.stop()
+        self.party = party
+        self.frames = max(1, int(seconds / 0.035))
         for rect in (rects or monitors()):
             try:
                 self.wins.append(self._build(rect))
@@ -412,10 +427,12 @@ class Glow:
         w.geometry(f"{gw}x{gh}+{l}+{t}")
         c = tk.Canvas(w, width=gw, height=gh, bg=KEY, highlightthickness=0)
         c.pack()
+        ids = []
         for inset, width, color in GLOW_BANDS:
             half = width / 2.0
-            c.create_rectangle(inset + half, inset + half, gw - inset - half, gh - inset - half,
-                               outline=color, width=width)
+            ids.append(c.create_rectangle(inset + half, inset + half, gw - inset - half, gh - inset - half,
+                                          outline=color, width=width))
+        self.bands.append((c, ids))
         w.deiconify()
         w.update_idletasks()
         self._click_through(w)
@@ -440,12 +457,19 @@ class Glow:
     def _tick(self):
         if not self.wins:
             return
-        if self.step > self.FRAMES:
+        if self.step > self.frames:
             self.stop()
             return
-        k = self.step / self.FRAMES
-        a = 0.85 * math.sin(math.pi * k) * (0.55 + 0.45 * abs(math.sin(math.pi * 3 * k)))   # 세 번 맥박
+        k = self.step / self.frames
+        if self.party:
+            a = 0.4 + 0.45 * abs(math.sin(self.step * 0.35))     # 쉬지 않고 빠르게
+        else:
+            a = 0.85 * math.sin(math.pi * k) * (0.55 + 0.45 * abs(math.sin(math.pi * 3 * k)))   # 세 번 맥박
         try:
+            if self.party:
+                for c, ids in self.bands:
+                    for i, item in enumerate(ids):
+                        c.itemconfig(item, outline=PARTY_COLORS[(i + self.step // 3) % len(PARTY_COLORS)])
             for w in self.wins:
                 w.attributes("-alpha", round(max(0.0, min(1.0, a)), 3))
         except tk.TclError:
@@ -461,6 +485,7 @@ class Glow:
             except tk.TclError:
                 pass
             self.timer = None
+        self.bands = []
         wins, self.wins = self.wins, []
         for w in wins:
             try:
@@ -552,6 +577,9 @@ class Pet:
         self.x, self.y_show, self.y_hide, self.y = 0, 0, 0, 0
         self.drag_from = None       # 끌기 시작점 (None이면 끄는 중이 아님)
         self.dragging = False
+        self.special = False        # 특별 알림 연출 중
+        self.special_done = ""      # 특별 알림을 마지막으로 울린 날짜
+        self.stop_special = False   # 펫을 눌러 특별 알림을 닫았는지
         self.place(*self.home())    # 저장해 둔 자리, 없으면 주 모니터 오른쪽 아래
         self.finished = False
         self.tick = 0
@@ -633,6 +661,8 @@ class Pet:
         was_drag, self.dragging, self.drag_from = self.dragging, False, None
         if was_drag:
             self.place(self.x, self.y, save=True)
+        elif self.special:          # 특별 알림은 눌러서 바로 닫을 수 있다
+            self.stop_special = True
         elif not self.busy:
             self.pop()
 
@@ -657,14 +687,18 @@ class Pet:
 
     # ---- 시각 효과 ----
     def fx_burst(self):
-        """알림 시작 연출: 화면 테두리 번쩍 + 반짝이 한 무더기."""
-        self.fx_until = self.tick + 60          # 약 3초
-        if self.cfg["fx_glow"]:
-            self.glow.flash()
-        self.spawn_sparks(18)
+        """알림 시작 연출: 화면 테두리 번쩍 + 반짝이 한 무더기. 특별 알림은 설정을 무시하고 최대로."""
+        self.fx_until = self.tick + ((SPECIAL_HOLD + 3) * 20 if self.special else 60)
+        if self.special:
+            self.glow.flash(party=True, seconds=SPECIAL_HOLD + 2)
+            self.spawn_sparks(44, force=True)
+        else:
+            if self.cfg["fx_glow"]:
+                self.glow.flash()
+            self.spawn_sparks(18)
 
-    def spawn_sparks(self, n):
-        if not self.cfg["fx_sparkle"]:
+    def spawn_sparks(self, n, force=False):
+        if not (force or self.cfg["fx_sparkle"]):
             return
         cx = W // 2
         for _ in range(n):
@@ -674,13 +708,16 @@ class Pet:
                 "x": cx + random.uniform(-55, 55), "y": PET_TOP + random.uniform(0, 55),
                 "vx": math.cos(a) * sp, "vy": math.sin(a) * sp - 2.4,
                 "age": 0, "life": random.randint(14, 28),
-                "r": random.uniform(3.5, 8.0), "col": random.choice(SPARK_COLORS),
+                "r": random.uniform(3.5, 8.0),
+                "col": random.choice(PARTY_COLORS if self.special else SPARK_COLORS),
             })
 
     def step_fx(self):
         """반짝이와 폴짝 뛰기를 한 프레임 진행한다."""
         cfg = self.cfg
-        if self.talking and self.tick % 10 == 0:
+        if self.talking and self.special and self.tick % 4 == 0:
+            self.spawn_sparks(7, force=True)    # 특별 알림은 설정과 상관없이 계속 터뜨린다
+        elif self.talking and self.tick % 10 == 0:
             self.spawn_sparks(4)                # 말하는 동안에도 계속 눈에 띄게
         alive = []
         for sp in self.sparks:
@@ -695,10 +732,11 @@ class Pet:
         self.sparks = alive
 
         hop = 0.0
-        if self.talking and cfg["fx_hop"] and not self.dragging:
-            ph = (self.tick % 16) / 16.0        # 0.8초에 한 번, 뛰었다가 쉬었다가
+        if self.talking and (cfg["fx_hop"] or self.special) and not self.dragging:
+            cycle, height = (10, 32) if self.special else (16, 18)
+            ph = (self.tick % cycle) / float(cycle)   # 한 번 뛰고 그만큼 쉬고
             if ph < 0.5:
-                hop = 18 * math.sin(math.pi * ph * 2)
+                hop = height * math.sin(math.pi * ph * 2)
         if hop or self.hopping:                 # 착지하면 원래 자리로 한 번만 되돌린다
             self.hopping = bool(hop)
             self.root.geometry(f"+{self.x}+{int(self.y - hop)}")
@@ -733,6 +771,13 @@ class Pet:
         ttk.Spinbox(f, from_=1, to=240, textvariable=interval, width=6).grid(row=row, column=1, sticky="w")
         hint("정각 기준으로 울려요 (10분 → 7:00, 7:10, 7:20 ...)", row + 1)
         row += 2
+
+        special_v = tk.BooleanVar(value=cfg.get("special", True))
+        ttk.Checkbutton(f, text=f"월요일 {SPECIAL_AT} 특별 알림: {SPECIAL_TEXT}", variable=special_v).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=3)
+        ttk.Button(f, text="🎉 미리 보기", command=lambda: apply() and self.pop(special=True)).grid(
+            row=row, column=2, padx=4)
+        row += 1
 
         speak_v = tk.BooleanVar(value=cfg["speak"])
         ttk.Checkbutton(f, text="음성으로 읽어주기", variable=speak_v).grid(
@@ -869,7 +914,7 @@ class Pet:
                        sound=sound_v.get().strip(), messages=[] if msgs == MESSAGES else msgs,
                        api_from=from_v.get().strip(), api_to=to_v.get().strip(), monthly_char_limit=lim,
                        silent=silent_v.get(), quiet_sec=qs, fx_glow=glow_v.get(), fx_sparkle=spark_v.get(),
-                       fx_hop=hop_v.get(), fx_gif=gif_v.get().strip())
+                       fx_hop=hop_v.get(), fx_gif=gif_v.get().strip(), special=special_v.get())
             k = key_v.get().strip()
             if k != api_key():
                 try:
@@ -930,19 +975,34 @@ class Pet:
     # ---- 스케줄 / 동작 ----
     def schedule(self):
         now = time.time()
-        if now - self.next_at > 60:     # 절전 등으로 알림 시각을 놓쳤으면 엉뚱한 시각에 나오지 않고 다음 시각을 기다린다
+        if self.special_due() and self.pop(special=True):
+            self.special_done = time.strftime("%Y-%m-%d")
+        elif now - self.next_at > 60:   # 절전 등으로 알림 시각을 놓쳤으면 엉뚱한 시각에 나오지 않고 다음 시각을 기다린다
             self.next_at = next_slot(self.cfg["interval_min"])
         elif not self.busy and now >= self.next_at:
             self.pop()
         self.root.after(1000, self.schedule)
 
-    def pop(self, force=False):
-        """force: 설정 창에서 직접 부를 때. 생성 시간대 밖이어도 고른 목소리로 시각 멘트를 만든다."""
+    def special_due(self):
+        """오늘이 그 요일이고, 그 시각부터 몇 분 안이고, 아직 안 울렸으면 울릴 차례."""
+        if not self.cfg.get("special", True):
+            return False
+        lt = time.localtime()
+        if lt.tm_wday != SPECIAL_WEEKDAY or self.special_done == time.strftime("%Y-%m-%d", lt):
+            return False
+        at = to_min(SPECIAL_AT)
+        return at <= lt.tm_hour * 60 + lt.tm_min < at + SPECIAL_CATCHUP
+
+    def pop(self, force=False, special=False):
+        """force: 설정 창에서 직접 부를 때. 생성 시간대 밖이어도 고른 목소리로 시각 멘트를 만든다.
+        special: 월요일 특별 알림. 나왔으면 True를 돌려준다."""
         if self.busy:
-            return
+            return False
         self.busy = True
+        self.special = special
         self.fx_burst()          # 올라오는 동안 화면 테두리가 먼저 알려준다
-        self.slide(self.y_show, lambda: self.begin_talk(force))
+        self.slide(self.y_show, self.begin_special if special else (lambda: self.begin_talk(force)))
+        return True
 
     def slide(self, target, done, step=0.25):
         dy = (target - self.y) * step
@@ -983,6 +1043,34 @@ class Pet:
             used = EDGE_FALLBACK
             tclip, mclip = get_clip(ttext, used, cfg), get_clip(msg, used, cfg)
         return ttext, [c for c in (tclip, mclip) if c]
+
+    def begin_special(self):
+        """설정을 모두 제치고 화려하게 알린다. 소리만은 무음 모드를 따른다(조용한 자리를 지키려고)."""
+        cfg = self.cfg
+        self.talking = True
+        self.finished = False
+        self.stop_special = False
+        self.bubble = SPECIAL_TEXT
+        quiet = cfg["silent"]
+
+        def work():
+            try:
+                end = time.time() + SPECIAL_HOLD
+                if not quiet:
+                    # 시간대·음성 끄기 설정과 상관없이 이 문구만큼은 만든다(한 번 만들면 계속 재사용)
+                    clip = get_clip(SPECIAL_TEXT, cfg["voice"], cfg) or get_clip(SPECIAL_TEXT, EDGE_FALLBACK, cfg)
+                    if self.sound and not self.stop_special:
+                        play_sound(self.sound)
+                    for i in range(2):          # 두 번 읽어 준다
+                        if clip and not self.stop_special:
+                            play_sound(clip, f"sp{i}")
+                while time.time() < end and not self.stop_special:
+                    time.sleep(0.2)
+            finally:
+                self.finished = True
+
+        threading.Thread(target=work, daemon=True).start()
+        self.wait_talk()
 
     def begin_talk(self, force=False):
         cfg = self.cfg
@@ -1025,6 +1113,8 @@ class Pet:
         if self.finished:
             self.talking = False
             self.bubble = ""
+            if self.special:
+                self.glow.stop()
             self.next_at = next_slot(self.cfg["interval_min"])
             self.slide(self.y_hide, self.end)
         else:
@@ -1032,6 +1122,7 @@ class Pet:
 
     def end(self):
         self.busy = False
+        self.special = False
 
     # ---- 그리기 ----
     def animate(self):
@@ -1097,9 +1188,14 @@ class Pet:
         k = min(1.0, (self.tick - self.bubble_at + 1) / 5.0)
         scale = 1.0 if k >= 1 else 0.72 + 0.28 * k + 0.06 * math.sin(math.pi * k)
         ox, oy = W / 2.0, (y0 + y1) / 2.0
+        # 특별 알림: 좌우로 흔들리고 테두리 색이 돌고 글자가 커졌다 작아진다
+        wob = 5 * math.sin(self.tick * 0.55) if self.special else 0
+        edge = PARTY_COLORS[(self.tick // 3) % len(PARTY_COLORS)] if self.special else "#5b4636"
+        ink = PARTY_INK[(self.tick // 4) % len(PARTY_INK)] if self.special else "#3a2a20"
+        font = ("맑은 고딕", 14 + (self.tick // 4) % 2 * 2, "bold") if self.special else ("맑은 고딕", 11, "bold")
 
         def sx_(x):
-            return ox + (x - ox) * scale
+            return ox + (x - ox) * scale + wob
 
         def sy_(y):
             return oy + (y - oy) * scale
@@ -1107,16 +1203,16 @@ class Pet:
         pts = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1, x1 - r, y1,
                x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
         c.create_polygon([sx_(v) if i % 2 == 0 else sy_(v) for i, v in enumerate(pts)],
-                         smooth=True, fill="white", outline="#5b4636", width=3)
+                         smooth=True, fill="white", outline=edge, width=5 if self.special else 3)
         tx, ty = W // 2, y1
         c.create_polygon(sx_(tx - 14), sy_(ty - 1), sx_(tx + 14), sy_(ty - 1), sx_(tx), sy_(ty + 22),
                          fill="white", outline="")
         c.create_line(sx_(tx - 14), sy_(ty), sx_(tx), sy_(ty + 22), sx_(tx + 14), sy_(ty),
-                      fill="#5b4636", width=3)
-        c.create_line(sx_(tx - 12), sy_(ty + 1), sx_(tx + 12), sy_(ty + 1), fill="white", width=4)
+                      fill=edge, width=5 if self.special else 3)
+        c.create_line(sx_(tx - 12), sy_(ty + 1), sx_(tx + 12), sy_(ty + 1), fill="white", width=5)
         if k > 0.7:
-            c.create_text(W // 2, (y0 + y1) // 2, text=text, width=W - 60, justify="center",
-                          font=("맑은 고딕", 11, "bold"), fill="#3a2a20")
+            c.create_text(W // 2 + wob, (y0 + y1) // 2, text=text, width=W - 60, justify="center",
+                          font=font, fill=ink)
 
 
 if __name__ == "__main__":
