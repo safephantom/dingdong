@@ -2,12 +2,16 @@
 
 음성: Google Cloud TTS(Chirp3 HD) 중심. 한 번 만든 mp3는 audio_cache/ 에 저장해 재사용하고,
 API 사용은 사용 시간대·월 글자 수 한도로 제한한다. 실패하면 edge-tts로 대체하고, 그것도 안 되면 말풍선만 띄운다.
+
+소리를 낼 수 없는 자리에서는 '무음 모드'로 딩동·음성을 끄고, 화면 테두리 번쩍임·반짝이·폴짝 뛰기 같은
+시각 효과만으로 알린다. 원하면 직접 고른 GIF를 펫 뒤에서 함께 재생할 수도 있다.
 """
 import asyncio
 import base64
 import ctypes
 import hashlib
 import json
+import math
 import os
 import random
 import sys
@@ -34,6 +38,11 @@ PET_TOP = 190          # 캔버스 안에서 펫 머리 꼭대기 y
 PEEK = 55              # 숨어 있을 때 화면에 보이는 높이(px)
 KEY = "#010101"        # 투명 처리할 색
 
+# 시각 효과: 화면 테두리 글로우(바깥부터 inset, 굵기, 색), 반짝이 색
+GLOW_BANDS = [(0, 4, "#fff8d6"), (4, 6, "#ffd54f"), (10, 8, "#ffb300"), (18, 10, "#fb8c00")]
+SPARK_COLORS = ("#ffd54f", "#fff59d", "#ffffff", "#ffb74d", "#b3e5fc", "#f8bbd0")
+GWL_EXSTYLE, WS_EX_LAYERED, WS_EX_TRANSPARENT, WS_EX_NOACTIVATE = -20, 0x80000, 0x20, 0x08000000
+
 # 여성 음성만. Chirp3 HD(최신 고품질) → Neural2 → WaveNet → Standard 순으로 자연스럽다.
 _HD = [("아오이데", "Aoede"), ("코레", "Kore"), ("레다", "Leda"), ("제피르", "Zephyr"), ("아케르나르", "Achernar"),
        ("아우토노에", "Autonoe"), ("칼리로에", "Callirrhoe"), ("데스피나", "Despina"), ("에리노메", "Erinome"),
@@ -57,6 +66,13 @@ DEFAULTS = {
     "sound": "", "messages": [],
     "api_from": "07:40", "api_to": "12:00",   # 이 시간대에만 새 '시각 멘트'를 API로 생성
     "monthly_char_limit": 50000,              # 한 달 API 글자 수 상한
+    "silent": False,          # 무음 모드: 딩동·음성 없이 화면 효과로만 알린다
+    "quiet_sec": 8,           # 소리 없이 알릴 때 말풍선을 띄워두는 시간(초)
+    "fx_glow": True,          # 화면 테두리 번쩍이기
+    "fx_sparkle": True,       # 펫 주변 반짝이
+    "fx_hop": True,           # 말하는 동안 폴짝폴짝 뛰기
+    "fx_gif": "",             # 펫 뒤에서 재생할 효과 GIF(선택)
+    "pos": None,              # 끌어다 놓은 자리 [x, 그 모니터 작업 영역의 아래쪽 y]
 }
 
 # 시각 읽기 문구. {t} 는 '오후 7시 10분' / '오후 7시 정각' (항상 받침으로 끝나 '이' 계열이 자연스럽다)
@@ -122,6 +138,14 @@ def save_config(cfg):
             json.dump(cfg, f, ensure_ascii=False, indent=2)
     except OSError:
         pass
+
+
+def cfg_int(cfg, key, lo, hi):
+    """설정 파일이 망가져 있어도 멈추지 않게, 범위 안의 정수로 맞춰 돌려준다."""
+    try:
+        return max(lo, min(hi, int(cfg[key])))
+    except (KeyError, TypeError, ValueError):
+        return DEFAULTS[key]
 
 
 # ---------------- 소리 ----------------
@@ -305,6 +329,210 @@ def work_area():
     return rect.left, rect.top, rect.right, rect.bottom
 
 
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+
+MONITORENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_int, wintypes.HMONITOR, wintypes.HDC,
+                                     ctypes.POINTER(wintypes.RECT), wintypes.LPARAM)
+
+
+def monitors():
+    """모든 모니터의 작업 영역(작업 표시줄 제외)을 왼쪽부터 차례로."""
+    found = []
+
+    def collect(hmon, hdc, lprc, lparam):
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(MONITORINFO)
+        if ctypes.windll.user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+            w = mi.rcWork
+            found.append((w.left, w.top, w.right, w.bottom))
+        return 1
+
+    try:
+        ctypes.windll.user32.EnumDisplayMonitors(None, None, MONITORENUMPROC(collect), 0)
+    except Exception:
+        pass
+    return sorted(found) or [work_area()]
+
+
+def monitor_at(x, y):
+    """그 점이 있는 모니터. 화면 밖이면(모니터를 뺐거나 배치가 바뀌면) 가장 가까운 모니터."""
+    ms = monitors()
+    for m in ms:
+        if m[0] <= x < m[2] and m[1] <= y < m[3]:
+            return m
+    return min(ms, key=lambda m: max(m[0] - x, 0, x - m[2]) ** 2 + max(m[1] - y, 0, y - m[3]) ** 2)
+
+
+def star_points(x, y, r):
+    """네 갈래 반짝이 모양의 좌표."""
+    pts = []
+    for i in range(8):
+        rad = r if i % 2 == 0 else r * 0.33
+        a = i * math.pi / 4 - math.pi / 2
+        pts += [x + math.cos(a) * rad, y + math.sin(a) * rad]
+    return pts
+
+
+class Glow:
+    """알림 때 화면 테두리를 잠깐 번쩍이는 오버레이 창. 클릭은 그대로 통과한다."""
+    FRAMES = 46          # 35ms x 46 = 약 1.6초
+
+    def __init__(self, master):
+        self.master = master
+        self.wins = []
+        self.step = 0
+        self.timer = None
+
+    def flash(self, rects=None):
+        """rects 를 주면 그 영역들에, 없으면 모든 모니터에 테두리를 띄운다."""
+        self.stop()
+        for rect in (rects or monitors()):
+            try:
+                self.wins.append(self._build(rect))
+            except tk.TclError:
+                pass
+        if not self.wins:
+            return
+        self.step = 0
+        self._tick()
+
+    def _build(self, rect):
+        l, t, r, b = rect
+        gw, gh = r - l, b - t
+        w = tk.Toplevel(self.master)
+        w.withdraw()
+        w.overrideredirect(True)
+        w.attributes("-topmost", True)
+        w.attributes("-alpha", 0.0)
+        w.attributes("-transparentcolor", KEY)
+        w.config(bg=KEY)
+        w.geometry(f"{gw}x{gh}+{l}+{t}")
+        c = tk.Canvas(w, width=gw, height=gh, bg=KEY, highlightthickness=0)
+        c.pack()
+        for inset, width, color in GLOW_BANDS:
+            half = width / 2.0
+            c.create_rectangle(inset + half, inset + half, gw - inset - half, gh - inset - half,
+                               outline=color, width=width)
+        w.deiconify()
+        w.update_idletasks()
+        self._click_through(w)
+        return w
+
+    @staticmethod
+    def _click_through(w):
+        """테두리 위에서도 마우스가 아래 창으로 통과하고, 포커스를 빼앗지 않게 한다."""
+        try:
+            u = ctypes.windll.user32
+            u.GetParent.argtypes, u.GetParent.restype = [wintypes.HWND], wintypes.HWND
+            u.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+            u.GetWindowLongW.restype = wintypes.LONG
+            u.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.LONG]
+            u.SetWindowLongW.restype = wintypes.LONG
+            hwnd = wintypes.HWND(u.GetParent(wintypes.HWND(w.winfo_id())) or w.winfo_id())
+            ex = u.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            u.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE)
+        except Exception:
+            pass
+
+    def _tick(self):
+        if not self.wins:
+            return
+        if self.step > self.FRAMES:
+            self.stop()
+            return
+        k = self.step / self.FRAMES
+        a = 0.85 * math.sin(math.pi * k) * (0.55 + 0.45 * abs(math.sin(math.pi * 3 * k)))   # 세 번 맥박
+        try:
+            for w in self.wins:
+                w.attributes("-alpha", round(max(0.0, min(1.0, a)), 3))
+        except tk.TclError:
+            self.stop()
+            return
+        self.step += 1
+        self.timer = self.master.after(35, self._tick)
+
+    def stop(self):
+        if self.timer:                      # 끝나기 전에 다시 부르면 예약해 둔 다음 프레임부터 취소
+            try:
+                self.master.after_cancel(self.timer)
+            except tk.TclError:
+                pass
+            self.timer = None
+        wins, self.wins = self.wins, []
+        for w in wins:
+            try:
+                w.destroy()
+            except tk.TclError:
+                pass
+
+
+class GifClip:
+    """효과용 GIF를 tkinter가 그릴 수 있는 프레임 목록으로 읽어 둔다(같은 파일은 한 번만).
+
+    웹에서 받은 gif는 대개 바뀐 부분만 프레임으로 저장한다. 낱장으로 읽으면 구멍이 뚫려 보이므로
+    앞 프레임 위에 겹쳐 완성한다. Pillow가 깔려 있으면 합성·축소를 맡겨 더 깔끔하게 만든다.
+    """
+    MAX_FRAMES = 60
+    _cache = {}
+
+    @classmethod
+    def load(cls, path, box=210):
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            key = (path, os.path.getmtime(path), box)
+        except OSError:
+            return None
+        if key not in cls._cache:
+            cls._cache[key] = cls._with_pillow(path, box) or cls._with_tk(path, box)
+        return cls._cache[key]
+
+    @classmethod
+    def _with_pillow(cls, path, box):
+        try:
+            from PIL import Image, ImageTk
+        except ImportError:
+            return None
+        try:
+            frames = []
+            with Image.open(path) as im:
+                for i in range(cls.MAX_FRAMES):
+                    try:
+                        im.seek(i)     # 순서대로 넘기면 Pillow가 프레임을 합성해 준다
+                    except EOFError:
+                        break
+                    f = im.convert("RGBA")
+                    big = max(f.size)
+                    if big > box:
+                        f = f.resize((max(1, round(f.width * box / big)), max(1, round(f.height * box / big))),
+                                     Image.LANCZOS)
+                    frames.append(ImageTk.PhotoImage(f))
+            return frames or None
+        except Exception:
+            return None
+
+    @classmethod
+    def _with_tk(cls, path, box):
+        frames, canvas = [], None
+        for i in range(cls.MAX_FRAMES):
+            try:
+                sub = tk.PhotoImage(file=path, format=f"gif -index {i}")
+            except tk.TclError:
+                break
+            if canvas is None:
+                canvas = tk.PhotoImage(width=sub.width(), height=sub.height())
+            canvas.tk.call(canvas, "copy", sub, "-compositingrule", "overlay")   # 투명한 곳은 앞 프레임 유지
+            img = canvas.copy()
+            big = max(img.width(), img.height())
+            if big > box:              # tkinter만으로는 정수 배율 축소만 된다
+                img = img.subsample(int(math.ceil(big / box)))
+            frames.append(img)
+        return frames or None
+
+
 class Pet:
     def __init__(self):
         self.cfg = load_config()
@@ -318,32 +546,162 @@ class Pet:
         self.c = tk.Canvas(r, width=W, height=H, bg=KEY, highlightthickness=0)
         self.c.pack()
 
-        l, t, rt, b = work_area()
-        self.x = rt - W - 20
-        self.y_show = b - H
-        self.y_hide = b - PET_TOP - PEEK
-        self.y = self.y_hide
-        r.geometry(f"{W}x{H}+{self.x}+{self.y}")
-
         self.talking = False
         self.bubble = ""
         self.busy = False
+        self.x, self.y_show, self.y_hide, self.y = 0, 0, 0, 0
+        self.drag_from = None       # 끌기 시작점 (None이면 끄는 중이 아님)
+        self.dragging = False
+        self.place(*self.home())    # 저장해 둔 자리, 없으면 주 모니터 오른쪽 아래
         self.finished = False
         self.tick = 0
         self.blink_until = 0
         self.win = None
         self.next_at = next_slot(self.cfg["interval_min"])
+        self.sparks = []            # 날아다니는 반짝이
+        self.hopping = False        # 창을 위아래로 흔드는 중인지
+        self.fx_until = 0           # 이 tick까지 효과(GIF 등)를 보여준다
+        self.last_bubble = ""
+        self.bubble_at = 0          # 말풍선이 뜬 tick (등장 연출용)
+        self.glow = Glow(r)
+        self.gif_frames = GifClip.load(self.cfg["fx_gif"])
 
         self.menu = tk.Menu(r, tearoff=0)
         self.menu.add_command(label="지금 나오기", command=self.pop)
+        self.silent_v = tk.BooleanVar(value=self.cfg["silent"])
+        self.menu.add_checkbutton(label="무음 모드 (화면으로만 알리기)", variable=self.silent_v,
+                                  command=self.toggle_silent)
         self.menu.add_command(label="설정...", command=self.open_settings)
+        pos_menu = tk.Menu(self.menu, tearoff=0)
+        pos_menu.add_command(label="이 모니터 왼쪽 아래", command=lambda: self.snap("left"))
+        pos_menu.add_command(label="이 모니터 오른쪽 아래", command=lambda: self.snap("right"))
+        pos_menu.add_command(label="다음 모니터로", command=self.next_monitor)
+        pos_menu.add_separator()
+        pos_menu.add_command(label="기본 자리로 되돌리기", command=self.reset_pos)
+        self.menu.add_cascade(label="위치 (끌어서도 옮길 수 있어요)", menu=pos_menu)
         self.menu.add_separator()
         self.menu.add_command(label="종료", command=r.destroy)
         self.c.bind("<Button-3>", lambda e: self.menu.tk_popup(e.x_root, e.y_root))
-        self.c.bind("<Button-1>", lambda e: None if self.busy else self.pop())
+        self.c.bind("<Button-1>", self.press)
+        self.c.bind("<B1-Motion>", self.drag)
+        self.c.bind("<ButtonRelease-1>", self.drop)
 
         self.animate()
         self.schedule()
+
+    # ---- 자리 잡기 ----
+    def home(self):
+        """저장해 둔 자리. 없으면 주 모니터 오른쪽 아래."""
+        pos = self.cfg.get("pos")
+        try:
+            return int(pos[0]), int(pos[1]) - H
+        except (TypeError, ValueError, IndexError):
+            l, t, r, b = work_area()
+            return r - W - 20, b - H
+
+    def mon(self):
+        """펫이 지금 올라가 있는 모니터의 작업 영역."""
+        return monitor_at(self.x + W // 2, int(self.y) + H // 2)
+
+    def place(self, x, y, save=False):
+        """(x, y)에 있는 펫을 그 자리 모니터의 아래쪽에 붙인다. 숨었다 나오려면 화면 바닥이 필요하다."""
+        ml, mt, mr, mb = monitor_at(int(x) + W // 2, int(y) + H // 2)
+        self.x = max(ml, min(mr - W, int(x)))
+        self.y_show = mb - H
+        self.y_hide = mb - PET_TOP - PEEK
+        self.y = self.y_show if self.busy else self.y_hide
+        self.root.geometry(f"{W}x{H}+{self.x}+{int(self.y)}")
+        if save:
+            self.cfg["pos"] = [self.x, mb]
+            save_config(self.cfg)
+
+    def press(self, e):
+        self.drag_from = (e.x_root, e.y_root, self.x, int(self.y))
+        self.dragging = False
+
+    def drag(self, e):
+        if not self.drag_from:
+            return
+        x0, y0, px, py = self.drag_from
+        if not self.dragging and abs(e.x_root - x0) + abs(e.y_root - y0) < 6:
+            return          # 클릭하다 손이 살짝 떨린 정도는 끌기로 보지 않는다
+        self.dragging = True
+        self.x, self.y = px + e.x_root - x0, py + e.y_root - y0
+        self.root.geometry(f"+{self.x}+{int(self.y)}")
+
+    def drop(self, e):
+        was_drag, self.dragging, self.drag_from = self.dragging, False, None
+        if was_drag:
+            self.place(self.x, self.y, save=True)
+        elif not self.busy:
+            self.pop()
+
+    def snap(self, side):
+        ml, mt, mr, mb = self.mon()
+        self.place(ml + 20 if side == "left" else mr - W - 20, mb - H, save=True)
+
+    def next_monitor(self):
+        ms, cur = monitors(), self.mon()
+        nl, nt, nr, nb = ms[(ms.index(cur) + 1) % len(ms)] if cur in ms else ms[0]
+        left = self.x + W / 2 - cur[0] < (cur[2] - cur[0]) / 2   # 있던 쪽(왼쪽/오른쪽)을 지켜 준다
+        self.place(nl + 20 if left else nr - W - 20, nb - H, save=True)
+
+    def reset_pos(self):
+        l, t, r, b = work_area()
+        self.place(r - W - 20, b - H, save=True)
+
+    def toggle_silent(self):
+        """우클릭 메뉴에서 바로 무음 모드를 켜고 끈다."""
+        self.cfg["silent"] = self.silent_v.get()
+        save_config(self.cfg)
+
+    # ---- 시각 효과 ----
+    def fx_burst(self):
+        """알림 시작 연출: 화면 테두리 번쩍 + 반짝이 한 무더기."""
+        self.fx_until = self.tick + 60          # 약 3초
+        if self.cfg["fx_glow"]:
+            self.glow.flash()
+        self.spawn_sparks(18)
+
+    def spawn_sparks(self, n):
+        if not self.cfg["fx_sparkle"]:
+            return
+        cx = W // 2
+        for _ in range(n):
+            a = random.uniform(0, 2 * math.pi)
+            sp = random.uniform(1.6, 4.4)
+            self.sparks.append({
+                "x": cx + random.uniform(-55, 55), "y": PET_TOP + random.uniform(0, 55),
+                "vx": math.cos(a) * sp, "vy": math.sin(a) * sp - 2.4,
+                "age": 0, "life": random.randint(14, 28),
+                "r": random.uniform(3.5, 8.0), "col": random.choice(SPARK_COLORS),
+            })
+
+    def step_fx(self):
+        """반짝이와 폴짝 뛰기를 한 프레임 진행한다."""
+        cfg = self.cfg
+        if self.talking and self.tick % 10 == 0:
+            self.spawn_sparks(4)                # 말하는 동안에도 계속 눈에 띄게
+        alive = []
+        for sp in self.sparks:
+            sp["age"] += 1
+            if sp["age"] > sp["life"]:
+                continue
+            sp["x"] += sp["vx"]
+            sp["y"] += sp["vy"]
+            sp["vy"] += 0.18                    # 중력
+            sp["vx"] *= 0.99
+            alive.append(sp)
+        self.sparks = alive
+
+        hop = 0.0
+        if self.talking and cfg["fx_hop"] and not self.dragging:
+            ph = (self.tick % 16) / 16.0        # 0.8초에 한 번, 뛰었다가 쉬었다가
+            if ph < 0.5:
+                hop = 18 * math.sin(math.pi * ph * 2)
+        if hop or self.hopping:                 # 착지하면 원래 자리로 한 번만 되돌린다
+            self.hopping = bool(hop)
+            self.root.geometry(f"+{self.x}+{int(self.y - hop)}")
 
     # ---- 설정 창 ----
     def open_settings(self):
@@ -364,6 +722,11 @@ class Pet:
 
         def hint(text, r):
             ttk.Label(f, text=text, foreground="#666").grid(row=r, column=0, columnspan=3, sticky="w")
+
+        ttk.Label(f, foreground="#666",
+                  text="펫은 마우스로 끌어서 옮길 수 있어요. 놓으면 그 모니터 아래쪽에 붙어요. "
+                       "(우클릭 → 위치 메뉴로도 이동)").grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        row += 1
 
         interval = tk.IntVar(value=cfg["interval_min"])
         label("알림 간격(분)", row)
@@ -415,6 +778,37 @@ class Pet:
         hint("비워두면 폴더 안의 첫 mp3를 사용해요", row + 1)
         row += 2
 
+        fxf = ttk.LabelFrame(f, text=" 소리 없이 일할 때 ", padding=8)
+        fxf.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(8, 2))
+        row += 1
+        silent_v = tk.BooleanVar(value=cfg["silent"])
+        ttk.Checkbutton(fxf, text="무음 모드 — 딩동·음성 없이 화면 효과로만 알리기", variable=silent_v).grid(
+            row=0, column=0, sticky="w")
+        glow_v = tk.BooleanVar(value=cfg["fx_glow"])
+        spark_v = tk.BooleanVar(value=cfg["fx_sparkle"])
+        hop_v = tk.BooleanVar(value=cfg["fx_hop"])
+        quiet_v = tk.IntVar(value=cfg["quiet_sec"])
+        line = ttk.Frame(fxf)
+        line.grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Checkbutton(line, text="화면 테두리 번쩍", variable=glow_v).pack(side="left")
+        ttk.Checkbutton(line, text="반짝이", variable=spark_v).pack(side="left", padx=8)
+        ttk.Checkbutton(line, text="폴짝폴짝", variable=hop_v).pack(side="left")
+        ttk.Label(line, text="    말풍선 유지").pack(side="left")
+        ttk.Spinbox(line, from_=2, to=60, textvariable=quiet_v, width=4).pack(side="left", padx=4)
+        ttk.Label(line, text="초").pack(side="left")
+        gif_v = tk.StringVar(value=cfg["fx_gif"])
+        gl = ttk.Frame(fxf)
+        gl.grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(gl, text="효과 GIF").pack(side="left")
+        ttk.Entry(gl, textvariable=gif_v, width=24).pack(side="left", padx=4)
+        ttk.Button(gl, text="찾아보기", command=lambda: gif_v.set(
+            filedialog.askopenfilename(parent=w, filetypes=[("GIF", "*.gif")]) or gif_v.get())).pack(side="left")
+        ttk.Button(gl, text="지우기", command=lambda: gif_v.set("")).pack(side="left", padx=4)
+        ttk.Button(gl, text="✨ 효과 미리 보기", command=lambda: apply() and self.fx_burst()).pack(side="left", padx=4)
+        ttk.Label(fxf, foreground="#666",
+                  text="배경이 투명한 gif를 펫 뒤에서 재생해요. 비워두면 안 씁니다.").grid(
+            row=3, column=0, sticky="w", pady=(5, 0))
+
         ttk.Separator(f).grid(row=row, column=0, columnspan=3, sticky="ew", pady=6)
         row += 1
         label("Google API 키", row)
@@ -459,17 +853,23 @@ class Pet:
                 if not 1 <= n <= 240:
                     raise ValueError
                 lim = int(limit_v.get())
+                qs = int(quiet_v.get())
+                if not 2 <= qs <= 60:
+                    raise ValueError
                 for hhmm in (from_v.get(), to_v.get()):
                     h, m = hhmm.split(":")
                     if not (0 <= int(h) < 24 and 0 <= int(m) < 60):
                         raise ValueError
             except (ValueError, tk.TclError):
-                messagebox.showwarning("설정", "간격(1~240), 시간대(HH:MM), 한도를 올바르게 입력해주세요.", parent=w)
+                messagebox.showwarning("설정", "간격(1~240), 말풍선 유지 시간(2~60초), 시간대(HH:MM), 한도를 "
+                                              "올바르게 입력해주세요.", parent=w)
                 return False
             msgs = [l.strip() for l in txt.get("1.0", "end").splitlines() if l.strip()]
             cfg.update(interval_min=n, speak=speak_v.get(), voice=VOICES[voice_v.get()],
                        sound=sound_v.get().strip(), messages=[] if msgs == MESSAGES else msgs,
-                       api_from=from_v.get().strip(), api_to=to_v.get().strip(), monthly_char_limit=lim)
+                       api_from=from_v.get().strip(), api_to=to_v.get().strip(), monthly_char_limit=lim,
+                       silent=silent_v.get(), quiet_sec=qs, fx_glow=glow_v.get(), fx_sparkle=spark_v.get(),
+                       fx_hop=hop_v.get(), fx_gif=gif_v.get().strip())
             k = key_v.get().strip()
             if k != api_key():
                 try:
@@ -478,6 +878,11 @@ class Pet:
                 except OSError:
                     pass
             self.sound = notification_sound(cfg["sound"])
+            self.silent_v.set(cfg["silent"])            # 우클릭 메뉴 체크 표시도 맞춰 둔다
+            self.gif_frames = GifClip.load(cfg["fx_gif"])
+            if cfg["fx_gif"] and not self.gif_frames:
+                messagebox.showwarning("효과 GIF", "이 GIF를 읽지 못했어요.\n애니메이션 gif가 맞는지, 파일이 "
+                                                 "깨지지 않았는지 확인해주세요.", parent=w)
             self.next_at = next_slot(n)
             save_config(cfg)
             return True
@@ -536,6 +941,7 @@ class Pet:
         if self.busy:
             return
         self.busy = True
+        self.fx_burst()          # 올라오는 동안 화면 테두리가 먼저 알려준다
         self.slide(self.y_show, lambda: self.begin_talk(force))
 
     def slide(self, target, done, step=0.25):
@@ -590,13 +996,15 @@ class Pet:
         def prepare():   # 딩동이 울리는 동안 음성 준비
             result["clips"] = self.prepare_clips(lt, msg, force)
 
+        quiet = cfg["silent"]      # 무음 모드: 딩동도 음성도 쓰지 않는다
+
         def work():
             try:
                 gen = None
-                if cfg["speak"]:
+                if cfg["speak"] and not quiet:
                     gen = threading.Thread(target=prepare)
                     gen.start()
-                if self.sound:
+                if self.sound and not quiet:
                     play_sound(self.sound)
                 if gen:
                     gen.join()
@@ -604,8 +1012,8 @@ class Pet:
                 self.bubble = f"{ttext}\n{msg}"
                 for i, clip in enumerate(clips):
                     play_sound(clip, f"tts{i}")
-                if not clips:              # 음성 끔 / 오프라인: 말풍선만 잠시 보여준다
-                    time.sleep(4)
+                if not clips:              # 무음 모드 / 음성 끔 / 오프라인: 말풍선을 그만큼 띄워 둔다
+                    time.sleep(cfg_int(cfg, "quiet_sec", 2, 60))
             finally:
                 time.sleep(0.8)
                 self.finished = True
@@ -628,6 +1036,7 @@ class Pet:
     # ---- 그리기 ----
     def animate(self):
         self.tick += 1
+        self.step_fx()
         self.draw()
         self.root.after(50, self.animate)
 
@@ -639,6 +1048,10 @@ class Pet:
             bob = int(4 * abs(((self.tick % 12) - 6) / 6.0)) if self.talking else 0
         cx, top = W // 2, PET_TOP - bob
 
+        if self.bubble != self.last_bubble:
+            self.last_bubble, self.bubble_at = self.bubble, self.tick
+        if self.gif_frames and (self.talking or self.tick < self.fx_until):
+            c.create_image(cx, top + 25, image=self.gif_frames[(self.tick // 2) % len(self.gif_frames)])
         if self.bubble:
             self.draw_bubble(self.bubble)
 
@@ -671,19 +1084,39 @@ class Pet:
         for sx in (-1, 1):   # 수염
             for dy in (-4, 6):
                 c.create_line(cx + sx * 45, top + 72 + dy, cx + sx * 78, top + 68 + dy * 2, fill=outline, width=2)
+        for sp in self.sparks:   # 반짝이는 펫 앞에서 터진다
+            k = 1 - sp["age"] / float(sp["life"])
+            c.create_polygon(star_points(sp["x"], sp["y"], sp["r"] * (0.35 + 0.65 * k)),
+                             fill=sp["col"], outline="")
 
     def draw_bubble(self, text):
         c = self.c
         x0, y0, x1, y1 = 15, 10, W - 15, 150
         r = 18
+        # 뜰 때 작게 시작해 통통 튀어나온다(5프레임). 글자는 거의 다 커진 뒤에 보여준다.
+        k = min(1.0, (self.tick - self.bubble_at + 1) / 5.0)
+        scale = 1.0 if k >= 1 else 0.72 + 0.28 * k + 0.06 * math.sin(math.pi * k)
+        ox, oy = W / 2.0, (y0 + y1) / 2.0
+
+        def sx_(x):
+            return ox + (x - ox) * scale
+
+        def sy_(y):
+            return oy + (y - oy) * scale
+
         pts = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1, x1 - r, y1,
                x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
-        c.create_polygon(pts, smooth=True, fill="white", outline="#5b4636", width=3)
-        c.create_polygon(W // 2 - 14, y1 - 1, W // 2 + 14, y1 - 1, W // 2, y1 + 22, fill="white", outline="")
-        c.create_line(W // 2 - 14, y1, W // 2, y1 + 22, W // 2 + 14, y1, fill="#5b4636", width=3)
-        c.create_line(W // 2 - 12, y1 + 1, W // 2 + 12, y1 + 1, fill="white", width=4)
-        c.create_text(W // 2, (y0 + y1) // 2, text=text, width=W - 60, justify="center",
-                      font=("맑은 고딕", 11, "bold"), fill="#3a2a20")
+        c.create_polygon([sx_(v) if i % 2 == 0 else sy_(v) for i, v in enumerate(pts)],
+                         smooth=True, fill="white", outline="#5b4636", width=3)
+        tx, ty = W // 2, y1
+        c.create_polygon(sx_(tx - 14), sy_(ty - 1), sx_(tx + 14), sy_(ty - 1), sx_(tx), sy_(ty + 22),
+                         fill="white", outline="")
+        c.create_line(sx_(tx - 14), sy_(ty), sx_(tx), sy_(ty + 22), sx_(tx + 14), sy_(ty),
+                      fill="#5b4636", width=3)
+        c.create_line(sx_(tx - 12), sy_(ty + 1), sx_(tx + 12), sy_(ty + 1), fill="white", width=4)
+        if k > 0.7:
+            c.create_text(W // 2, (y0 + y1) // 2, text=text, width=W - 60, justify="center",
+                          font=("맑은 고딕", 11, "bold"), fill="#3a2a20")
 
 
 if __name__ == "__main__":
