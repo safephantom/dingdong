@@ -70,7 +70,10 @@ VOICES.update({
 EDGE_FALLBACK = "edge:ko-KR-SunHiNeural"
 PREVIEW_TEXT = "안녕하세요! 지금은 오후 3시 20분이에요. 오늘도 힘내봐요!"
 
+CHARACTERS = {"고양이": "cat", "해파리": "jelly"}
+
 DEFAULTS = {
+    "character": "cat",
     "interval_min": 10, "speak": True, "voice": "google:ko-KR-Chirp3-HD-Aoede",
     "sound": "", "messages": [],
     "api_from": "07:40", "api_to": "12:00",   # 이 시간대에만 새 '시각 멘트'를 API로 생성
@@ -139,6 +142,8 @@ def load_config():
         pass
     if cfg.get("voice") not in VOICES.values():   # 목록에서 빠진 음성(남성·Windows 등) → 기본 음성
         cfg["voice"] = DEFAULTS["voice"]
+    if cfg.get("character") not in CHARACTERS.values():
+        cfg["character"] = DEFAULTS["character"]
     return cfg
 
 
@@ -386,6 +391,15 @@ def star_points(x, y, r):
     return pts
 
 
+def jelly_squeeze(p):
+    """헤엄 주기 p(0~1)에서 갓을 오므린 정도(0~1). 앞 1/3 동안 재빨리 오므리고 나머지 동안 천천히 편다.
+    양 끝에서 속도가 0으로 이어져 끊김 없이 되풀이된다."""
+    p %= 1.0
+    if p < 1 / 3.0:
+        return (1 - math.cos(math.pi * p * 3)) / 2
+    return (1 + math.cos(math.pi * (p - 1 / 3.0) * 1.5)) / 2
+
+
 class Glow:
     """알림 때 화면 테두리를 잠깐 번쩍이는 오버레이 창. 클릭은 그대로 통과한다."""
 
@@ -584,6 +598,7 @@ class Pet:
         self.finished = False
         self.tick = 0
         self.blink_until = 0
+        self.swim = 0.0   # 해파리 헤엄 한 주기 중 어디쯤인지 (0~1)
         self.win = None
         self.next_at = next_slot(self.cfg["interval_min"])
         self.sparks = []            # 날아다니는 반짝이
@@ -766,6 +781,14 @@ class Pet:
                        "(우클릭 → 위치 메뉴로도 이동)").grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 8))
         row += 1
 
+        label("캐릭터", row)
+        char_v = tk.StringVar(value=cfg["character"])
+        chf = ttk.Frame(f)
+        chf.grid(row=row, column=1, columnspan=2, sticky="w")
+        for name, key in CHARACTERS.items():
+            ttk.Radiobutton(chf, text=name, value=key, variable=char_v).pack(side="left", padx=(0, 12))
+        row += 1
+
         interval = tk.IntVar(value=cfg["interval_min"])
         label("알림 간격(분)", row)
         ttk.Spinbox(f, from_=1, to=240, textvariable=interval, width=6).grid(row=row, column=1, sticky="w")
@@ -910,7 +933,7 @@ class Pet:
                                               "올바르게 입력해주세요.", parent=w)
                 return False
             msgs = [l.strip() for l in txt.get("1.0", "end").splitlines() if l.strip()]
-            cfg.update(interval_min=n, speak=speak_v.get(), voice=VOICES[voice_v.get()],
+            cfg.update(character=char_v.get(), interval_min=n, speak=speak_v.get(), voice=VOICES[voice_v.get()],
                        sound=sound_v.get().strip(), messages=[] if msgs == MESSAGES else msgs,
                        api_from=from_v.get().strip(), api_to=to_v.get().strip(), monthly_char_limit=lim,
                        silent=silent_v.get(), quiet_sec=qs, fx_glow=glow_v.get(), fx_sparkle=spark_v.get(),
@@ -1135,7 +1158,7 @@ class Pet:
         c = self.c
         c.delete("all")
         bob = 0
-        if self.busy:
+        if self.busy and self.cfg["character"] == "cat":   # 해파리는 헤엄이 빨라지는 것으로 대신한다
             bob = int(4 * abs(((self.tick % 12) - 6) / 6.0)) if self.talking else 0
         cx, top = W // 2, PET_TOP - bob
 
@@ -1146,6 +1169,21 @@ class Pet:
         if self.bubble:
             self.draw_bubble(self.bubble)
 
+        now = self.tick
+        if now >= self.blink_until and random.random() < 0.02:
+            self.blink_until = now + 3
+        blinking = now < self.blink_until
+        if self.cfg["character"] == "jelly":
+            self.draw_jelly(cx, top, blinking)
+        else:
+            self.draw_cat(cx, top, blinking)
+        for sp in self.sparks:   # 반짝이는 펫 앞에서 터진다
+            k = 1 - sp["age"] / float(sp["life"])
+            c.create_polygon(star_points(sp["x"], sp["y"], sp["r"] * (0.35 + 0.65 * k)),
+                             fill=sp["col"], outline="")
+
+    def draw_cat(self, cx, top, blinking):
+        c = self.c
         outline, fill, ink = "#5b4636", "#ffd9a8", "#3a2a20"
         for sx in (-1, 1):   # 귀
             c.create_polygon(cx + sx * 30, top + 25, cx + sx * 62, top - 8, cx + sx * 66, top + 40,
@@ -1153,10 +1191,6 @@ class Pet:
             c.create_polygon(cx + sx * 40, top + 25, cx + sx * 58, top + 5, cx + sx * 60, top + 32,
                              fill="#ffb0a8", outline="")
         c.create_oval(cx - 75, top, cx + 75, top + 125, fill=fill, outline=outline, width=3)   # 머리
-        now = self.tick
-        if now >= self.blink_until and random.random() < 0.02:
-            self.blink_until = now + 3
-        blinking = now < self.blink_until
         for sx in (-1, 1):   # 눈, 볼
             ex, ey = cx + sx * 30, top + 55
             if blinking:
@@ -1175,10 +1209,68 @@ class Pet:
         for sx in (-1, 1):   # 수염
             for dy in (-4, 6):
                 c.create_line(cx + sx * 45, top + 72 + dy, cx + sx * 78, top + 68 + dy * 2, fill=outline, width=2)
-        for sp in self.sparks:   # 반짝이는 펫 앞에서 터진다
-            k = 1 - sp["age"] / float(sp["life"])
-            c.create_polygon(star_points(sp["x"], sp["y"], sp["r"] * (0.35 + 0.65 * k)),
-                             fill=sp["col"], outline="")
+
+    def draw_jelly(self, cx, top, blinking):
+        """분홍 해파리. 갓을 재빨리 오므려 쑥 떠오르고 천천히 펴며 내려앉기를 부드럽게 되풀이하고,
+        그 사이에도 몸은 둥실거리고 촉수는 살랑인다."""
+        c = self.c
+        outline, fill, ink = "#c23d7c", "#ffa8d2", "#3d1a2b"
+        self.swim = (self.swim + (1 / 14.0 if self.talking else 1 / 32.0)) % 1   # 말할 때는 더 바쁘게 헤엄친다
+        s = jelly_squeeze(self.swim)
+        hw, bh, spread, seg = 76 - 12 * s, 64 + 10 * s, 1 - 0.7 * s, 9 + 2 * s
+        top += 3 * math.sin(self.tick * 0.12) - 7 * jelly_squeeze(self.swim - 0.08)   # 몸은 모양보다 살짝 늦게 떠오른다
+        rim = top + bh
+
+        for i, ox in enumerate((-0.55, -0.2, 0.2, 0.55)):   # 촉수 (갓 뒤에 가려지도록 먼저)
+            pts = []
+            for j in range(6):
+                k = j / 5.0
+                sway = 7 * k * math.sin(self.tick * 0.22 + i * 1.7 + j * 0.9)
+                pts += [cx + ox * hw + ox * 30 * spread * k + sway, rim - 6 + j * seg]
+            c.create_line(pts, smooth=True, width=10, capstyle="round", fill=outline)
+            c.create_line(pts, smooth=True, width=5, capstyle="round", fill="#ff8cc3" if i % 2 else "#ffc2e0")
+
+        pts = []
+        for i in range(17):                          # 둥근 갓
+            a = math.pi * i / 16
+            pts += [cx - hw * math.cos(a), rim - bh * math.sin(a) ** 0.8]
+        n = 5
+        for j in range(n):                           # 갓 아래 물결 테두리 (오른쪽 → 왼쪽)
+            x0 = cx + hw - 2 * hw * j / n
+            pts += [x0, rim, x0, rim, x0 - hw / n, rim + 12]
+        pts += [cx - hw, rim, cx - hw, rim]
+        c.create_polygon(pts, smooth=True, fill=fill, outline=outline, width=3)
+
+        c.create_arc(cx - hw + 12, top + 10, cx + hw - 12, 2 * rim - top - 10, start=112, extent=38,
+                     style="arc", outline="#ffe6f2", width=5)                        # 반들반들 윤기
+        for fx_, fy_, r in ((0.4, 0.26, 8), (0.12, 0.12, 5), (-0.18, 0.3, 4)):     # 동글동글 무늬
+            x, y = cx + fx_ * hw, top + fy_ * bh
+            c.create_oval(x - r, y - r * 0.8, x + r, y + r * 0.8, fill="#ff7ab8", outline="")
+
+        a, r = 0.55, 12                               # 오른쪽 관자놀이에 꽂은 보라 꽃핀 (갓 테두리에 걸친다)
+        x, y = cx + hw * math.cos(a) - 4, rim - bh * math.sin(a) ** 0.8
+        petals = [(x + math.cos(t) * r * 0.62, y + math.sin(t) * r * 0.62)
+                  for t in (0.3 + k * 2 * math.pi / 5 for k in range(5))]
+        for grow, col in ((1.5, "#7b3fb5"), (0, "#b07ae6")):   # 진한 테두리를 먼저 깔고 꽃잎을 얹는다
+            pr = r * 0.4 + grow
+            for px, py in petals:
+                c.create_oval(px - pr, py - pr, px + pr, py + pr, fill=col, outline="")
+        c.create_oval(x - r * 0.28, y - r * 0.28, x + r * 0.28, y + r * 0.28, fill="#f3e2ff", outline="")
+
+        ey = rim - 27
+        for sx in (-1, 1):   # 눈, 볼
+            ex = cx + sx * 26
+            if blinking:
+                c.create_line(ex - 9, ey, ex + 9, ey, fill=ink, width=3, capstyle="round")
+            else:
+                c.create_oval(ex - 8, ey - 10, ex + 8, ey + 10, fill=ink, outline="")
+                c.create_oval(ex - 4, ey - 7, ex + 1, ey - 2, fill="white", outline="")
+            c.create_oval(ex + sx * 8 - 8, ey + 10, ex + sx * 8 + 8, ey + 17, fill="#ff6fa8", outline="")
+        my = rim - 10
+        if self.talking and (self.tick // 3) % 2:
+            c.create_oval(cx - 7, my - 6, cx + 7, my + 8, fill="#8a2d4f", outline=ink, width=2)
+        else:
+            c.create_arc(cx - 8, my - 10, cx + 8, my + 4, start=200, extent=140, style="arc", outline=ink, width=2)
 
     def draw_bubble(self, text):
         c = self.c
