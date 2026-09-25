@@ -105,17 +105,17 @@ class Jelly:
         # 펴면 다시 벌어지고 동그래진다. 갓보다 살짝 늦게 따라와 말랑하게 출렁인다.
         f = jelly_squeeze(self.swim - 0.05)
         ey = rim - 27 - 6 * f
-        erx, ery = 8 - 1.5 * f, 10 + 2 * f
-        for sx in (-1, 1):   # 눈, 볼
-            ex = cx + sx * (26 - 5 * f)
+        erx, ery = 8 - 0.75 * f, 10 + 2 * f
+        for sx in (-1, 1):   # 눈, 볼 (옆으로는 조금만 모여 얼굴 인상을 지킨다)
+            ex = cx + sx * (26 - 2.5 * f)
             if blinking:
                 c.create_line(ex - erx - 1, ey, ex + erx + 1, ey, fill=ink, width=3, capstyle="round")
             else:
                 c.create_oval(ex - erx, ey - ery, ex + erx, ey + ery, fill=ink, outline="")
                 c.create_oval(ex - erx / 2, ey - ery * 0.7, ex + erx / 8, ey - ery * 0.2, fill="white", outline="")
-            chx, chw, chy = ex + sx * (8 - 2 * f), 8 - 2.5 * f, ey + ery
+            chx, chw, chy = ex + sx * (8 - f), 8 - 1.25 * f, ey + ery
             c.create_oval(chx - chw, chy, chx + chw, chy + 7, fill="#ff6fa8", outline="")
-        my, mw = rim - 10 - 4 * f, 8 - 3 * f
+        my, mw = rim - 10 - 4 * f, 8 - 1.5 * f
         if talking and (tick // 3) % 2:
             c.create_oval(cx - mw + 1, my - 6, cx + mw - 1, my + 8, fill="#8a2d4f", outline=ink, width=2)
         else:
